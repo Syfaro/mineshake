@@ -1,7 +1,9 @@
 use std::io::prelude::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
+
+static TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn encode_varint(num: u32) -> Vec<u8> {
     let mut val = num;
@@ -55,19 +57,6 @@ where
     Ok(result)
 }
 
-fn u16_to_u8(num: u16) -> [u8; 2] {
-    [((num >> 8) & 0xFF) as u8, (num & 0xFF) as u8]
-}
-
-fn u32_to_u8(num: u32) -> [u8; 4] {
-    [
-        ((num >> 24) & 0xFF) as u8,
-        ((num >> 16) & 0xFF) as u8,
-        ((num >> 8) & 0xFF) as u8,
-        (num & 0xFF) as u8,
-    ]
-}
-
 fn build_packet(data: Vec<u8>, id: u32) -> Vec<u8> {
     let id = encode_varint(id);
     let len = encode_varint((data.len() + id.len()) as u32);
@@ -87,7 +76,7 @@ fn build_handshake(host: &str, port: u16) -> Vec<u8> {
     data.extend(encode_varint(0x47));
     data.extend(encode_varint(host.len() as u32));
     data.extend(host.as_bytes());
-    data.extend(&u16_to_u8(port));
+    data.extend(&port.to_be_bytes());
     data.extend(encode_varint(1));
 
     data
@@ -115,18 +104,17 @@ fn resolve_srv(host: &str) -> Result<Option<String>, resolve::Error> {
 
     let name = format!("_minecraft._tcp.{}", host);
 
-    match resolver.resolve_record::<resolve::record::Srv>(&name) {
-        Err(_) => Ok(None),
-        Ok(records) => {
-            let result = if records.is_empty() {
-                None
-            } else {
-                Some(format!("{}:{}", records[0].target, records[0].port))
-            };
-
-            Ok(result)
-        }
-    }
+    Ok(resolver
+        .resolve_record::<resolve::record::Srv>(&name)
+        // Not resolving isn't an error, so convert to Option
+        .ok()
+        .and_then(|records| {
+            records
+                // Get the first resolved record
+                .get(0)
+                // And if we had one, convert it to ip:port format
+                .map(|record| format!("{}:{}", record.target, record.port))
+        }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,23 +232,19 @@ fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, Error> {
 
     match addrs.next() {
         Some(addr) => Ok(addr),
-        None => {
-            return Err(Error {
-                message: "unable to resolve".to_string(),
-                bad_server: true,
-            })
-        }
+        None => Err(Error {
+            message: "unable to resolve".to_string(),
+            bad_server: true,
+        }),
     }
 }
 
 pub fn send_ping(host: &str, port: u16) -> Result<Ping, Error> {
     let conn = resolve(host, port)?;
 
-    // TODO: allow configuration for read timeout
-    let second = std::time::Duration::new(1, 0);
-
-    let mut stream = TcpStream::connect_timeout(&conn, second)?;
-    stream.set_read_timeout(Some(second))?;
+    let mut stream = TcpStream::connect_timeout(&conn, TIMEOUT_DURATION)?;
+    stream.set_read_timeout(Some(TIMEOUT_DURATION))?;
+    stream.set_write_timeout(Some(TIMEOUT_DURATION))?;
 
     let handshake = build_packet(build_handshake(&host, port), 0x00);
     stream.write_all(&handshake)?;
@@ -299,7 +283,7 @@ fn parse_plugins(plugins: Option<String>) -> (String, Vec<String>) {
         None => vec![],
     };
 
-    return (server_mod_name.to_string(), plugins);
+    (server_mod_name.to_string(), plugins)
 }
 
 #[derive(Debug, Serialize)]
@@ -351,7 +335,7 @@ where
         None => return None,
     };
 
-    if &key != expected {
+    if key != expected {
         return None;
     }
 
@@ -367,11 +351,8 @@ where
     let mut _garbage = vec![0; 11];
     let _err = reader.read_exact(&mut _garbage);
 
-    loop {
-        match string_until_zero(&mut reader) {
-            Some(player) => players.push(player),
-            None => break,
-        }
+    while let Some(player) = string_until_zero(&mut reader) {
+        players.push(player);
     }
 
     players
@@ -382,13 +363,16 @@ pub fn send_query(host: &str, port: u16) -> Result<Query, Error> {
 
     let conn = resolve(host, port)?;
 
-    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(TIMEOUT_DURATION))?;
+    socket.set_write_timeout(Some(TIMEOUT_DURATION))?;
+
     socket.connect(conn)?;
 
-    let session_id = rand::random::<u32>() & 0x0F0F0F0F;
+    let session_id = rand::random::<u32>() & 0x0F0F_0F0F;
 
     let mut request = vec![0xFE, 0xFD, 0x09];
-    request.extend(&u32_to_u8(session_id));
+    request.extend(&session_id.to_be_bytes());
 
     socket.send(&request)?;
 
@@ -398,8 +382,8 @@ pub fn send_query(host: &str, port: u16) -> Result<Query, Error> {
     let challenge_token: i32 = String::from_utf8_lossy(&buf[5..len - 1]).parse()?;
 
     let mut request = vec![0xFE, 0xFD, 0x00];
-    request.extend(&u32_to_u8(session_id));
-    request.extend(&u32_to_u8(challenge_token as u32));
+    request.extend(&session_id.to_be_bytes());
+    request.extend(&challenge_token.to_be_bytes());
     request.extend(vec![0x00, 0x00, 0x00, 0x00]);
 
     socket.send(&request)?;
@@ -433,10 +417,7 @@ pub fn send_query(host: &str, port: u16) -> Result<Query, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_packet, encode_varint, parse_players, parse_plugins, read_varint, resolve_srv,
-        send_ping, send_query, string_until_zero, string_until_zero_expected,
-    };
+    use super::*;
 
     #[test]
     fn test_encode_varint() {
@@ -566,22 +547,17 @@ mod tests {
 
     #[test]
     fn test_send_ping() {
-        match send_ping("ping.minecraft.syfaro.net", 25565) {
-            Ok(ping) => println!("{:?}", ping),
-            Err(_) => assert!(false, "should not error"),
-        }
-
         match send_ping("s.nerd.nu", 25565) {
             Ok(ping) => println!("{:?}", ping),
-            Err(_) => assert!(false, "should not error"),
+            Err(err) => assert!(false, "should not error: {:?}", err),
         }
     }
 
     #[test]
     fn test_send_query() {
-        match send_query("127.0.0.1", 25565) {
+        match send_query("minescape.me", 25565) {
             Ok(query) => println!("{:?}", query),
-            Err(_e) => assert!(false, "should not error"),
+            Err(err) => assert!(false, "should not error: {:?}", err),
         }
     }
 }
