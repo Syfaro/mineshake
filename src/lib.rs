@@ -18,8 +18,6 @@ fn encode_varint(num: u32) -> Vec<u8> {
 
     varint.push((val & 0x7F) as u8);
 
-    println!("u32 {} varint was {} long", num, varint.len());
-
     varint
 }
 
