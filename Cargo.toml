@@ -1,14 +1,20 @@
 [package]
 name = "mineshake"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Syfaro <syfaro@huefox.com>"]
 edition = "2018"
 
 [dependencies]
-resolve = "0.2"
+tracing = "0.1"
+tracing-futures = "0.2"
+
+trust-dns-resolver = "0.19"
 rand = "0.7"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-tokio = { version = "0.2", features = ["macros", "net", "tcp", "io-util"] }
+tokio = { version = "0.2", features = ["net", "tcp", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "0.2", features = ["macros"] }

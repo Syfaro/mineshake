@@ -5,6 +5,7 @@ use tokio::{
 
 use serde::{Deserialize, Serialize};
 
+/// Encode a u32 into a VarInt.
 fn encode_varint(num: u32) -> Vec<u8> {
     let mut val = num;
     let mut varint: Vec<u8> = vec![];
@@ -17,9 +18,12 @@ fn encode_varint(num: u32) -> Vec<u8> {
 
     varint.push((val & 0x7F) as u8);
 
+    println!("u32 {} varint was {} long", num, varint.len());
+
     varint
 }
 
+/// Read a VarInt into a u32 from an AsyncRead type.
 async fn read_varint<T>(reader: &mut T) -> Result<u32, std::io::Error>
 where
     T: AsyncRead + Unpin,
@@ -57,11 +61,16 @@ where
     Ok(result)
 }
 
+/// Build a packet by:
+/// * Encoding a representation of the ID into a VarInt
+/// * Encoding the length of the ID and data into a VarInt
+/// * Creating a Vec to store that metadata along with the data
 fn build_packet(data: Vec<u8>, id: u32) -> Vec<u8> {
     let id = encode_varint(id);
     let len = encode_varint((data.len() + id.len()) as u32);
 
-    let mut packet = vec![];
+    // We know the exact size of the packet, so allocate exactly that.
+    let mut packet = Vec::with_capacity(id.len() + len.len() + data.len());
 
     packet.extend(len);
     packet.extend(id);
@@ -70,81 +79,91 @@ fn build_packet(data: Vec<u8>, id: u32) -> Vec<u8> {
     packet
 }
 
+/// Build a handshake packet by adding:
+/// * Magic data
+/// * Host length as a VarInt, the host, and the port
+/// * Next state of status
 fn build_handshake(host: &str, port: u16) -> Vec<u8> {
-    let mut data = vec![];
+    // Default capacity calculated by expected values.
+    // Explanation commented on each item as they are added.
+    let mut data = Vec::with_capacity(5 + host.len());
 
-    data.extend(encode_varint(0x47));
-    data.extend(encode_varint(host.len() as u32));
-    data.extend(host.as_bytes());
-    data.extend(&port.to_be_bytes());
-    data.extend(encode_varint(1));
+    data.extend(encode_varint(0x47)); // 1 byte
+    data.extend(encode_varint(host.len() as u32)); // probably 1 byte
+    data.extend(host.as_bytes()); // `host.len()` bytes
+    data.extend(&port.to_be_bytes()); // 2 bytes
+    data.extend(encode_varint(1)); // 1 byte
 
     data
 }
 
-#[cfg(unix)]
-fn get_dns_config() -> Result<resolve::DnsConfig, resolve::Error> {
-    Ok(resolve::DnsConfig::load_default()?)
-}
-
-#[cfg(windows)]
-fn get_dns_config() -> Result<resolve::DnsConfig, resolve::Error> {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    // TODO: make configurable
-    Ok(resolve::DnsConfig::with_name_servers(vec![
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 53),
-    ]))
-}
-
-fn resolve_srv(host: &str) -> Result<Option<String>, resolve::Error> {
-    let config = get_dns_config()?;
-    let resolver = resolve::DnsResolver::new(config)?;
+/// Resolve the Minecraft SRV record for a given host.
+///
+/// Looks up `_minecraft._tcp.` prepended to the given host.
+/// On successful result, returns the data as a string in the
+/// `host:port` format.
+#[tracing::instrument]
+async fn resolve_srv(host: &str) -> Option<String> {
+    let resolver = trust_dns_resolver::TokioAsyncResolver::tokio(
+        trust_dns_resolver::config::ResolverConfig::default(),
+        trust_dns_resolver::config::ResolverOpts::default(),
+    )
+    .await
+    .ok()?; // Discard any errors, assume it couldn't be resolved.
 
     let name = format!("_minecraft._tcp.{}", host);
+    let lookup = resolver.srv_lookup(name).await;
 
-    Ok(resolver
-        .resolve_record::<resolve::record::Srv>(&name)
-        // Not resolving isn't an error, so convert to Option
-        .ok()
-        .and_then(|records| {
-            records
-                // Get the first resolved record
-                .get(0)
-                // And if we had one, convert it to ip:port format
-                .map(|record| format!("{}:{}", record.target, record.port))
-        }))
+    tracing::debug!("host srv resolved to {:?}", lookup);
+
+    match lookup {
+        Err(_err) => None,
+        Ok(lookup) => lookup
+            .iter()
+            .next()
+            // Need to convert the SRV record into a common format
+            // so it can later be used by ToSocketAddrs.
+            .map(|item| format!("{}:{}", item.target(), item.port())),
+    }
 }
 
+/// Server version info.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Version {
     pub name: String,
     pub protocol: u32,
 }
 
+/// A player on the server and their ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerSample {
     pub name: String,
     pub id: String,
 }
 
+/// Info about players on a server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Players {
     pub max: u32,
     pub online: u32,
+    /// A subset of the players on the server.
     pub sample: Option<Vec<PlayerSample>>,
 }
 
+/// All info returned from a ping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ping {
     pub version: Version,
     pub players: Players,
+    /// The description is arbitrary JSON data that may
+    /// be parsed to get colors, etc.
     pub description: serde_json::Value,
     pub favicon: Option<String>,
 }
 
 impl Ping {
+    /// Extract all text fields from the server description.
+    /// Useful for environments that may only display plain text.
     pub fn get_motd(&self) -> Option<String> {
         // TODO: make this handle parsing extra fields
         match &self.description {
@@ -160,11 +179,23 @@ impl Ping {
     }
 }
 
+/// An error response.
 #[derive(Debug)]
 pub struct Error {
     /// If the server was unable to be resolved or connected to.
     pub bad_server: bool,
+    /// A message explaining the error. May be from this library
+    /// or underlying libraries.
     pub message: String,
+
+    /// Keep the underlying error, if it exists.
+    inner: Option<Box<dyn std::error::Error>>,
+}
+
+impl Into<Option<Box<dyn std::error::Error>>> for Error {
+    fn into(self) -> Option<Box<dyn std::error::Error>> {
+        self.inner
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -184,6 +215,7 @@ impl From<std::io::Error> for Error {
         Self {
             message: error.to_string(),
             bad_server: true,
+            inner: Some(Box::new(error)),
         }
     }
 }
@@ -193,6 +225,7 @@ impl From<std::string::FromUtf8Error> for Error {
         Self {
             message: error.to_string(),
             bad_server: false,
+            inner: Some(Box::new(error)),
         }
     }
 }
@@ -202,6 +235,7 @@ impl From<serde_json::error::Error> for Error {
         Self {
             message: error.to_string(),
             bad_server: false,
+            inner: Some(Box::new(error)),
         }
     }
 }
@@ -211,68 +245,108 @@ impl From<std::num::ParseIntError> for Error {
         Self {
             message: error.to_string(),
             bad_server: false,
+            inner: Some(Box::new(error)),
         }
     }
 }
 
+/// Resolve a host and port into a SocketAddr.
+///
+/// Unlike resolving SRV records, no result is an error
+/// as it means that the provided data cannot be connected to.
+#[tracing::instrument]
 async fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, Error> {
-    let resolved = resolve_srv(&host);
+    // Attempt to resolve the host, before checking for SRV records.
+    let mut addr = lookup_host(format!("{}:{}", host, port)).await?;
 
-    let host = if let Ok(resolved) = resolved {
-        if let Some(host) = resolved {
-            host
-        } else {
-            format!("{}:{}", host, port)
-        }
-    } else {
-        format!("{}:{}", host, port)
-    };
-
-    let mut addrs = lookup_host(host).await?;
-
-    match addrs.next() {
-        Some(addr) => Ok(addr),
-        None => Err(Error {
-            message: "unable to resolve".to_string(),
-            bad_server: true,
-        }),
+    // If we got an address, we're done and it can be returned.
+    if let Some(addr) = addr.next() {
+        tracing::debug!("host resolved to {:?}", addr);
+        return Ok(addr);
     }
+
+    // We didn't find an address, try seeing if there are SRV records.
+    let resolved = resolve_srv(&host).await;
+
+    // Ensure that we could resolve the the SRV record.
+    // If we couldn't find the SRV record there is no longer a chance
+    // we can connect to this server.
+    let host = resolved.ok_or_else(|| Error {
+        message: "unable to resolve".to_string(),
+        bad_server: true,
+        inner: None,
+    })?;
+
+    // Try looking up this SRV record.
+    let mut addr = lookup_host(host).await?;
+
+    // Return the SocketAddr from the SRV, or generate an Error.
+    addr.next().ok_or_else(|| Error {
+        message: "unable to resolve".to_string(),
+        bad_server: true,
+        inner: None,
+    })
 }
 
+/// Attempt to send a ping to a server.
+///
+/// Both server offline errors and resolution errors will be returned  as an
+/// error. If the `bad_server` field in error is true it means that it is a
+/// resolution or other failure. If it is false, the error was caused by not
+/// being able to communicate with the server.
+///
+/// In order to avoid resource exhaustion it is advisable to wrap this in
+/// a timeout as none are implemented within the library.
+#[tracing::instrument]
 pub async fn send_ping(host: &str, port: u16) -> Result<Ping, Error> {
-    let conn = resolve(host, port).await?;
+    // Resolve our host and port to a SocketAddr,
+    // then open a TCP connection.
+    let addr = resolve(host, port).await?;
+    let mut stream = TcpStream::connect(&addr).await?;
 
-    let mut stream = TcpStream::connect(&conn).await?;
-
+    // Create a handshake and write it.
     let handshake = build_packet(build_handshake(&host, port), 0x00);
     stream.write_all(&handshake).await?;
 
+    // Send a request packet.
     let request = build_packet(vec![], 0x00);
     stream.write_all(&request).await?;
 
+    // Read the packet ID length and packet ID, discard values.
+    // We do not care about what they were.
     let _packet_length = read_varint(&mut stream).await?;
     let _packet_id = read_varint(&mut stream).await?;
 
+    // Read the data length then read that much data into a vec.
     let string_len = read_varint(&mut stream).await? as usize;
-
     let mut data: Vec<u8> = vec![0; string_len];
     stream.read_exact(&mut data).await?;
 
+    // Attempt to parse the data into a UTF8 string and deserialize its
+    // JSON contents.
     let s = String::from_utf8(data)?;
     let ping: Ping = serde_json::from_str(&s)?;
 
     Ok(ping)
 }
 
+/// Parse plugins from an optional string.
 fn parse_plugins(plugins: Option<String>) -> (String, Vec<String>) {
+    // Ensure that we have plugins to parse. If not, return empty data.
     let plugins = match plugins {
         None => return ("".to_string(), vec![]),
         Some(plugins) => plugins,
     };
 
+    // Plugin data is provided in a format like this:
+    // `server_name: plugin1; plugin2`
+    // Start by splitting off the server name.
     let mut parts = plugins.split(": ");
 
+    // We always have a first part given that we had a string.
     let server_mod_name = parts.next().unwrap();
+
+    // If we have another match, attempt to parse plugins.
     let plugins: Vec<String> = match parts.next() {
         Some(plugins) => plugins
             .split("; ")
@@ -284,12 +358,14 @@ fn parse_plugins(plugins: Option<String>) -> (String, Vec<String>) {
     (server_mod_name.to_string(), plugins)
 }
 
+/// Info from a server query.
 #[derive(Debug, Serialize)]
 pub struct Query {
     pub hostname: String,
     pub gametype: String,
     pub game_id: String,
     pub version: String,
+    /// Server mod name and plugins, may be empty.
     pub plugins: (String, Vec<String>),
     pub map: String,
     pub numplayers: usize,
@@ -299,6 +375,11 @@ pub struct Query {
     pub players: Vec<String>,
 }
 
+/// Read data from an AsyncRead until a null byte is received, then convert data
+/// into a string lossily.
+///
+/// If no data was received before a null byte, it returns none. If an error
+/// occurs while reading, it discards the data and returns none.
 async fn string_until_zero<T>(reader: &mut T) -> Option<String>
 where
     T: AsyncRead + Unpin,
@@ -324,14 +405,15 @@ where
     Some(String::from_utf8_lossy(&items).to_string())
 }
 
+/// A variant of [string_until_zero] used for reading key value pairs.
+///
+/// It reads until a null byte, then asserts that string is equal to `expected`.
+/// If it is, it reads the next value and returns that. If not, returns none.
 async fn string_until_zero_expected<T>(mut reader: &mut T, expected: &str) -> Option<String>
 where
     T: AsyncRead + Unpin,
 {
-    let key = match string_until_zero(&mut reader).await {
-        Some(key) => key,
-        None => return None,
-    };
+    let key = string_until_zero(&mut reader).await?;
 
     if key != expected {
         return None;
@@ -340,17 +422,26 @@ where
     string_until_zero(&mut reader).await
 }
 
+/// Extract a list of players from an AsyncRead.
+///
+/// `ignore_garbage` is used to ignore the padding bytes between previous data
+/// and the list of players.
 async fn parse_players<T>(mut reader: &mut T, ignore_garbage: bool) -> Vec<String>
 where
     T: AsyncRead + Unpin,
 {
     let mut players = vec![];
 
+    // 10 bytes of padding to ignore if desired.
     if ignore_garbage {
+        // TODO: maybe assert that this is the expected padding?
+        // 01 70 6C 61 79 65 72 5F 00 00
         let mut _garbage = vec![0; 10];
         let _err = reader.read_exact(&mut _garbage).await;
     }
 
+    // Keep reading strings until there's nothing left. Each string is a
+    // player's username.
     while let Some(player) = string_until_zero(&mut reader).await {
         players.push(player);
     }
@@ -358,52 +449,62 @@ where
     players
 }
 
+/// Send a query to a server and get the response.
+///
+/// See [send_ping] for more information about timeouts and errors.
+///
+/// If data was missing, it is possible for fields to have empty values.
 pub async fn send_query(host: &str, port: u16) -> Result<Query, Error> {
-    let conn = resolve(host, port).await?;
-
+    // Resolve our host and port to a SocketAddr, bind a socket,
+    // and open a UDP connection to the host.
+    let addr = resolve(host, port).await?;
     let mut socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.connect(addr).await?;
 
-    socket.connect(conn).await?;
-
+    // Generate and send a random session ID for our packet.
     let session_id = rand::random::<u32>() & 0x0F0F_0F0F;
-
     let mut request = vec![0xFE, 0xFD, 0x09];
     request.extend(&session_id.to_be_bytes());
-
     socket.send(&request).await?;
 
+    // Receive up to 2KiB from connection.
     let mut buf: Vec<u8> = vec![0; 2048];
     let len = socket.recv(&mut buf).await?;
 
+    // Get the challenge token from the response.
     let challenge_token: i32 = String::from_utf8_lossy(&buf[5..len - 1]).parse()?;
 
+    // Create a packet with our session ID and magic to generate a response.
     let mut request = vec![0xFE, 0xFD, 0x00];
     request.extend(&session_id.to_be_bytes());
     request.extend(&challenge_token.to_be_bytes());
     request.extend(vec![0x00, 0x00, 0x00, 0x00]);
-
     socket.send(&request).await?;
 
+    // Receive data
+    // TODO: do we need handling for packets larger than 2KiB?
     let len = socket.recv(&mut buf).await?;
+    // Ignore type, session ID, and padding before trying to parse data.
     let mut cursor = std::io::Cursor::new(&buf[16..len - 1]);
 
+    // TODO: find a cleaner way of doing this
     Ok(Query {
         hostname: string_until_zero_expected(&mut cursor, "hostname")
             .await
-            .unwrap(),
+            .unwrap_or_else(String::new),
         gametype: string_until_zero_expected(&mut cursor, "gametype")
             .await
-            .unwrap(),
+            .unwrap_or_else(String::new),
         game_id: string_until_zero_expected(&mut cursor, "game_id")
             .await
-            .unwrap(),
+            .unwrap_or_else(String::new),
         version: string_until_zero_expected(&mut cursor, "version")
             .await
-            .unwrap(),
+            .unwrap_or_else(String::new),
         plugins: parse_plugins(string_until_zero_expected(&mut cursor, "plugins").await),
         map: string_until_zero_expected(&mut cursor, "map")
             .await
-            .unwrap(),
+            .unwrap_or_else(String::new),
         numplayers: string_until_zero_expected(&mut cursor, "numplayers")
             .await
             .unwrap()
@@ -421,7 +522,7 @@ pub async fn send_query(host: &str, port: u16) -> Result<Query, Error> {
             .unwrap_or(0),
         hostip: string_until_zero_expected(&mut cursor, "hostip")
             .await
-            .unwrap(),
+            .unwrap_or_else(String::new),
         players: parse_players(&mut cursor, true).await,
     })
 }
@@ -471,38 +572,17 @@ mod tests {
         assert_eq!(packet, vec![0x02, 0x00, 0x00]);
     }
 
-    #[test]
-    fn test_resolve_srv() {
-        let resolved = match resolve_srv("ping.minecraft.syfaro.net") {
-            Ok(resolved) => resolved,
-            Err(_) => {
+    #[tokio::test]
+    async fn test_resolve_srv() {
+        let host = match resolve_srv("ping.minecraft.syfaro.net").await {
+            Some(resolved) => resolved,
+            None => {
                 assert!(false, "should be able to resolve srv record");
                 return;
             }
         };
 
-        let host = match resolved {
-            Some(host) => host,
-            None => {
-                assert!(false, "should be able to find host from srv");
-                return;
-            }
-        };
-
         assert_eq!(host, "play.gotpvp.com.:25565");
-
-        let resolved = match resolve_srv("norecord.syfaro.net") {
-            Ok(resolved) => resolved,
-            Err(_) => {
-                assert!(
-                    false,
-                    "should not cause error when srv record does not exist"
-                );
-                return;
-            }
-        };
-
-        assert!(resolved.is_none());
     }
 
     #[tokio::test]
