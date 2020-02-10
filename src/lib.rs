@@ -1,9 +1,9 @@
-use std::io::prelude::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    net::{lookup_host, TcpStream, UdpSocket},
+};
 
 use serde::{Deserialize, Serialize};
-
-static TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn encode_varint(num: u32) -> Vec<u8> {
     let mut val = num;
@@ -20,9 +20,9 @@ fn encode_varint(num: u32) -> Vec<u8> {
     varint
 }
 
-fn read_varint<T>(reader: &mut T) -> Result<u32, std::io::Error>
+async fn read_varint<T>(reader: &mut T) -> Result<u32, std::io::Error>
 where
-    T: Read,
+    T: AsyncRead + Unpin,
 {
     // Storage for each byte as its read
     let mut buf: Vec<u8> = vec![0; 1];
@@ -33,7 +33,7 @@ where
 
     loop {
         // Read a single byte
-        reader.read_exact(&mut buf)?;
+        reader.read_exact(&mut buf).await?;
 
         // Ignore top bit, only care about 7 bits right now
         // However, we need 32 bits of working space to shift
@@ -215,7 +215,7 @@ impl From<std::num::ParseIntError> for Error {
     }
 }
 
-fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, Error> {
+async fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, Error> {
     let resolved = resolve_srv(&host);
 
     let host = if let Ok(resolved) = resolved {
@@ -228,7 +228,7 @@ fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, Error> {
         format!("{}:{}", host, port)
     };
 
-    let mut addrs = host.to_socket_addrs()?;
+    let mut addrs = lookup_host(host).await?;
 
     match addrs.next() {
         Some(addr) => Ok(addr),
@@ -239,26 +239,24 @@ fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, Error> {
     }
 }
 
-pub fn send_ping(host: &str, port: u16) -> Result<Ping, Error> {
-    let conn = resolve(host, port)?;
+pub async fn send_ping(host: &str, port: u16) -> Result<Ping, Error> {
+    let conn = resolve(host, port).await?;
 
-    let mut stream = TcpStream::connect_timeout(&conn, TIMEOUT_DURATION)?;
-    stream.set_read_timeout(Some(TIMEOUT_DURATION))?;
-    stream.set_write_timeout(Some(TIMEOUT_DURATION))?;
+    let mut stream = TcpStream::connect(&conn).await?;
 
     let handshake = build_packet(build_handshake(&host, port), 0x00);
-    stream.write_all(&handshake)?;
+    stream.write_all(&handshake).await?;
 
     let request = build_packet(vec![], 0x00);
-    stream.write_all(&request)?;
+    stream.write_all(&request).await?;
 
-    let _packet_length = read_varint(&mut stream)?;
-    let _packet_id = read_varint(&mut stream)?;
+    let _packet_length = read_varint(&mut stream).await?;
+    let _packet_id = read_varint(&mut stream).await?;
 
-    let string_len = read_varint(&mut stream)? as usize;
+    let string_len = read_varint(&mut stream).await? as usize;
 
     let mut data: Vec<u8> = vec![0; string_len];
-    stream.read_exact(&mut data)?;
+    stream.read_exact(&mut data).await?;
 
     let s = String::from_utf8(data)?;
     let ping: Ping = serde_json::from_str(&s)?;
@@ -301,15 +299,15 @@ pub struct Query {
     pub players: Vec<String>,
 }
 
-fn string_until_zero<T>(reader: &mut T) -> Option<String>
+async fn string_until_zero<T>(reader: &mut T) -> Option<String>
 where
-    T: Read,
+    T: AsyncRead + Unpin,
 {
     let mut items: Vec<u8> = vec![];
 
     let mut buf = [0; 1];
     loop {
-        if reader.read_exact(&mut buf).is_err() {
+        if reader.read_exact(&mut buf).await.is_err() {
             return None;
         }
 
@@ -326,11 +324,11 @@ where
     Some(String::from_utf8_lossy(&items).to_string())
 }
 
-fn string_until_zero_expected<T>(mut reader: &mut T, expected: &str) -> Option<String>
+async fn string_until_zero_expected<T>(mut reader: &mut T, expected: &str) -> Option<String>
 where
-    T: Read,
+    T: AsyncRead + Unpin,
 {
-    let key = match string_until_zero(&mut reader) {
+    let key = match string_until_zero(&mut reader).await {
         Some(key) => key,
         None => return None,
     };
@@ -339,45 +337,43 @@ where
         return None;
     }
 
-    string_until_zero(&mut reader)
+    string_until_zero(&mut reader).await
 }
 
-fn parse_players<T>(mut reader: &mut T) -> Vec<String>
+async fn parse_players<T>(mut reader: &mut T, ignore_garbage: bool) -> Vec<String>
 where
-    T: Read,
+    T: AsyncRead + Unpin,
 {
     let mut players = vec![];
 
-    let mut _garbage = vec![0; 11];
-    let _err = reader.read_exact(&mut _garbage);
+    if ignore_garbage {
+        let mut _garbage = vec![0; 10];
+        let _err = reader.read_exact(&mut _garbage).await;
+    }
 
-    while let Some(player) = string_until_zero(&mut reader) {
+    while let Some(player) = string_until_zero(&mut reader).await {
         players.push(player);
     }
 
     players
 }
 
-pub fn send_query(host: &str, port: u16) -> Result<Query, Error> {
-    use std::net::UdpSocket;
+pub async fn send_query(host: &str, port: u16) -> Result<Query, Error> {
+    let conn = resolve(host, port).await?;
 
-    let conn = resolve(host, port)?;
+    let mut socket = UdpSocket::bind("0.0.0.0:0").await?;
 
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.set_read_timeout(Some(TIMEOUT_DURATION))?;
-    socket.set_write_timeout(Some(TIMEOUT_DURATION))?;
-
-    socket.connect(conn)?;
+    socket.connect(conn).await?;
 
     let session_id = rand::random::<u32>() & 0x0F0F_0F0F;
 
     let mut request = vec![0xFE, 0xFD, 0x09];
     request.extend(&session_id.to_be_bytes());
 
-    socket.send(&request)?;
+    socket.send(&request).await?;
 
     let mut buf: Vec<u8> = vec![0; 2048];
-    let len = socket.recv(&mut buf)?;
+    let len = socket.recv(&mut buf).await?;
 
     let challenge_token: i32 = String::from_utf8_lossy(&buf[5..len - 1]).parse()?;
 
@@ -386,32 +382,47 @@ pub fn send_query(host: &str, port: u16) -> Result<Query, Error> {
     request.extend(&challenge_token.to_be_bytes());
     request.extend(vec![0x00, 0x00, 0x00, 0x00]);
 
-    socket.send(&request)?;
+    socket.send(&request).await?;
 
-    let len = socket.recv(&mut buf)?;
+    let len = socket.recv(&mut buf).await?;
     let mut cursor = std::io::Cursor::new(&buf[16..len - 1]);
 
     Ok(Query {
-        hostname: string_until_zero_expected(&mut cursor, "hostname").unwrap(),
-        gametype: string_until_zero_expected(&mut cursor, "gametype").unwrap(),
-        game_id: string_until_zero_expected(&mut cursor, "game_id").unwrap(),
-        version: string_until_zero_expected(&mut cursor, "version").unwrap(),
-        plugins: parse_plugins(string_until_zero_expected(&mut cursor, "plugins")),
-        map: string_until_zero_expected(&mut cursor, "map").unwrap(),
+        hostname: string_until_zero_expected(&mut cursor, "hostname")
+            .await
+            .unwrap(),
+        gametype: string_until_zero_expected(&mut cursor, "gametype")
+            .await
+            .unwrap(),
+        game_id: string_until_zero_expected(&mut cursor, "game_id")
+            .await
+            .unwrap(),
+        version: string_until_zero_expected(&mut cursor, "version")
+            .await
+            .unwrap(),
+        plugins: parse_plugins(string_until_zero_expected(&mut cursor, "plugins").await),
+        map: string_until_zero_expected(&mut cursor, "map")
+            .await
+            .unwrap(),
         numplayers: string_until_zero_expected(&mut cursor, "numplayers")
+            .await
             .unwrap()
             .parse()
             .unwrap_or(0),
         maxplayers: string_until_zero_expected(&mut cursor, "maxplayers")
+            .await
             .unwrap()
             .parse()
             .unwrap_or(0),
         hostport: string_until_zero_expected(&mut cursor, "hostport")
+            .await
             .unwrap()
             .parse()
             .unwrap_or(0),
-        hostip: string_until_zero_expected(&mut cursor, "hostip").unwrap(),
-        players: parse_players(&mut cursor),
+        hostip: string_until_zero_expected(&mut cursor, "hostip")
+            .await
+            .unwrap(),
+        players: parse_players(&mut cursor, true).await,
     })
 }
 
@@ -430,22 +441,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_read_varint() {
+    #[tokio::test]
+    async fn test_read_varint() {
         let src: Vec<u8> = vec![0x00];
-        assert_eq!(0, read_varint(&mut src.as_slice()).unwrap());
+        assert_eq!(0, read_varint(&mut src.as_slice()).await.unwrap());
 
         let src: Vec<u8> = vec![0x01];
-        assert_eq!(1, read_varint(&mut src.as_slice()).unwrap());
+        assert_eq!(1, read_varint(&mut src.as_slice()).await.unwrap());
 
         let src: Vec<u8> = vec![0xFF, 0x01];
-        assert_eq!(255, read_varint(&mut src.as_slice()).unwrap());
+        assert_eq!(255, read_varint(&mut src.as_slice()).await.unwrap());
 
         let src: Vec<u8> = vec![0b1000_0100, 0b0100_0000];
-        assert_eq!(8196, read_varint(&mut src.as_slice()).unwrap());
+        assert_eq!(8196, read_varint(&mut src.as_slice()).await.unwrap());
 
         let src: Vec<u8> = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x07];
-        assert_eq!(2_147_483_647, read_varint(&mut src.as_slice()).unwrap());
+        assert_eq!(
+            2_147_483_647,
+            read_varint(&mut src.as_slice()).await.unwrap()
+        );
     }
 
     #[test]
@@ -491,30 +505,30 @@ mod tests {
         assert!(resolved.is_none());
     }
 
-    #[test]
-    fn test_string_until_zero() {
+    #[tokio::test]
+    async fn test_string_until_zero() {
         let mut cursor = std::io::Cursor::new(vec![102, 111, 120, 0, 104, 105, 0]);
 
-        let msg = string_until_zero(&mut cursor);
+        let msg = string_until_zero(&mut cursor).await;
 
         assert!(!msg.is_none());
         assert_eq!(msg.unwrap(), "fox");
 
-        let msg = string_until_zero(&mut cursor);
+        let msg = string_until_zero(&mut cursor).await;
 
         assert!(!msg.is_none());
         assert_eq!(msg.unwrap(), "hi");
 
-        let msg = string_until_zero(&mut cursor);
+        let msg = string_until_zero(&mut cursor).await;
 
         assert!(msg.is_none());
     }
 
-    #[test]
-    fn test_string_until_zero_expected() {
+    #[tokio::test]
+    async fn test_string_until_zero_expected() {
         let mut cursor = std::io::Cursor::new(vec![107, 0, 118, 0]);
 
-        let msg = string_until_zero_expected(&mut cursor, "k");
+        let msg = string_until_zero_expected(&mut cursor, "k").await;
 
         assert!(!msg.is_none());
         assert_eq!(msg.unwrap(), "v");
@@ -537,25 +551,25 @@ mod tests {
         assert_eq!(plugins.1, vec!["WorldEdit 5.3", "CommandBook 2.1"]);
     }
 
-    #[test]
-    fn test_parse_players() {
+    #[tokio::test]
+    async fn test_parse_players() {
         let mut cursor = std::io::Cursor::new(vec![97, 0, 98, 0, 99, 0, 0]);
-        let players = parse_players(&mut cursor);
+        let players = parse_players(&mut cursor, false).await;
 
         assert_eq!(players, vec!["a", "b", "c"]);
     }
 
-    #[test]
-    fn test_send_ping() {
-        match send_ping("s.nerd.nu", 25565) {
+    #[tokio::test]
+    async fn test_send_ping() {
+        match send_ping("s.nerd.nu", 25565).await {
             Ok(ping) => println!("{:?}", ping),
             Err(err) => assert!(false, "should not error: {:?}", err),
         }
     }
 
-    #[test]
-    fn test_send_query() {
-        match send_query("minescape.me", 25565) {
+    #[tokio::test]
+    async fn test_send_query() {
+        match send_query("minescape.me", 25565).await {
             Ok(query) => println!("{:?}", query),
             Err(err) => assert!(false, "should not error: {:?}", err),
         }
