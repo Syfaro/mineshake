@@ -164,7 +164,7 @@ impl Ping {
 pub struct Error {
     /// If the server was unable to be resolved or connected to.
     pub bad_server: bool,
-    message: String,
+    pub message: String,
 }
 
 impl std::fmt::Display for Error {
