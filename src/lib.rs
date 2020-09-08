@@ -254,6 +254,19 @@ impl From<std::num::ParseIntError> for Error {
 /// as it means that the provided data cannot be connected to.
 #[tracing::instrument]
 async fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, Error> {
+    // Start by looking up SRV record.
+    if let Some(addr) = resolve_srv(&host).await {
+        // Try looking up this SRV record.
+        let mut addr = lookup_host(addr).await?;
+
+        // Return the SocketAddr from the SRV, or generate an Error.
+        return addr.next().ok_or_else(|| Error {
+            message: "unable to resolve".to_string(),
+            bad_server: true,
+            inner: None,
+        });
+    }
+
     // Attempt to resolve the host, before checking for SRV records.
     let mut addr = lookup_host(format!("{}:{}", host, port)).await?;
 
@@ -263,23 +276,8 @@ async fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, Error> {
         return Ok(addr);
     }
 
-    // We didn't find an address, try seeing if there are SRV records.
-    let resolved = resolve_srv(&host).await;
-
-    // Ensure that we could resolve the the SRV record.
-    // If we couldn't find the SRV record there is no longer a chance
-    // we can connect to this server.
-    let host = resolved.ok_or_else(|| Error {
-        message: "unable to resolve".to_string(),
-        bad_server: true,
-        inner: None,
-    })?;
-
-    // Try looking up this SRV record.
-    let mut addr = lookup_host(host).await?;
-
-    // Return the SocketAddr from the SRV, or generate an Error.
-    addr.next().ok_or_else(|| Error {
+    // There's nothing left we can do, given combination does not work.
+    Err(Error {
         message: "unable to resolve".to_string(),
         bad_server: true,
         inner: None,
