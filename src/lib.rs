@@ -358,17 +358,8 @@ fn parse_plugins(plugins: Option<String>) -> (String, Vec<String>) {
 /// Info from a server query.
 #[derive(Debug, Serialize)]
 pub struct Query {
-    pub hostname: String,
-    pub gametype: String,
-    pub game_id: String,
-    pub version: String,
-    /// Server mod name and plugins, may be empty.
-    pub plugins: (String, Vec<String>),
-    pub map: String,
-    pub numplayers: usize,
-    pub maxplayers: usize,
-    pub hostport: u16,
-    pub hostip: String,
+    pub kv: std::collections::HashMap<String, String>,
+    pub server: (String, Vec<String>),
     pub players: Vec<String>,
 }
 
@@ -400,23 +391,6 @@ where
     }
 
     Some(String::from_utf8_lossy(&items).to_string())
-}
-
-/// A variant of [string_until_zero] used for reading key value pairs.
-///
-/// It reads until a null byte, then asserts that string is equal to `expected`.
-/// If it is, it reads the next value and returns that. If not, returns none.
-async fn string_until_zero_expected<T>(mut reader: &mut T, expected: &str) -> Option<String>
-where
-    T: AsyncRead + Unpin,
-{
-    let key = string_until_zero(&mut reader).await?;
-
-    if key != expected {
-        return None;
-    }
-
-    string_until_zero(&mut reader).await
 }
 
 /// Extract a list of players from an AsyncRead.
@@ -483,43 +457,34 @@ pub async fn send_query(host: &str, port: u16) -> Result<Query, Error> {
     // Ignore type, session ID, and padding before trying to parse data.
     let mut cursor = std::io::Cursor::new(&buf[16..len - 1]);
 
-    // TODO: find a cleaner way of doing this
+    let mut kv = std::collections::HashMap::new();
+    let mut server = None;
+
+    while let Some(key) = string_until_zero(&mut cursor).await {
+        let value = match string_until_zero(&mut cursor).await {
+            Some(value) => value,
+            _ => {
+                tracing::warn!("had hey {} with no value", key);
+                continue;
+            }
+        };
+
+        match key.as_ref() {
+            "plugins" => {
+                server = Some(parse_plugins(Some(value)));
+            }
+            _ => {
+                kv.insert(key, value);
+            }
+        }
+    }
+
+    let players = parse_players(&mut cursor, true).await;
+
     Ok(Query {
-        hostname: string_until_zero_expected(&mut cursor, "hostname")
-            .await
-            .unwrap_or_else(String::new),
-        gametype: string_until_zero_expected(&mut cursor, "gametype")
-            .await
-            .unwrap_or_else(String::new),
-        game_id: string_until_zero_expected(&mut cursor, "game_id")
-            .await
-            .unwrap_or_else(String::new),
-        version: string_until_zero_expected(&mut cursor, "version")
-            .await
-            .unwrap_or_else(String::new),
-        plugins: parse_plugins(string_until_zero_expected(&mut cursor, "plugins").await),
-        map: string_until_zero_expected(&mut cursor, "map")
-            .await
-            .unwrap_or_else(String::new),
-        numplayers: string_until_zero_expected(&mut cursor, "numplayers")
-            .await
-            .unwrap()
-            .parse()
-            .unwrap_or(0),
-        maxplayers: string_until_zero_expected(&mut cursor, "maxplayers")
-            .await
-            .unwrap()
-            .parse()
-            .unwrap_or(0),
-        hostport: string_until_zero_expected(&mut cursor, "hostport")
-            .await
-            .unwrap()
-            .parse()
-            .unwrap_or(0),
-        hostip: string_until_zero_expected(&mut cursor, "hostip")
-            .await
-            .unwrap_or_else(String::new),
-        players: parse_players(&mut cursor, true).await,
+        kv,
+        players,
+        server: server.unwrap_or_default(),
     })
 }
 
@@ -582,6 +547,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_no_srv() {
+        assert!(resolve_srv("omegaserv.fr").await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_string_until_zero() {
         let mut cursor = std::io::Cursor::new(vec![102, 111, 120, 0, 104, 105, 0]);
 
@@ -598,16 +568,6 @@ mod tests {
         let msg = string_until_zero(&mut cursor).await;
 
         assert!(msg.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_string_until_zero_expected() {
-        let mut cursor = std::io::Cursor::new(vec![107, 0, 118, 0]);
-
-        let msg = string_until_zero_expected(&mut cursor, "k").await;
-
-        assert!(!msg.is_none());
-        assert_eq!(msg.unwrap(), "v");
     }
 
     #[test]
