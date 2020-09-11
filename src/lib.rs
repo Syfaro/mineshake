@@ -259,15 +259,16 @@ async fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, Error> {
         // Try looking up this SRV record.
         let mut addr = lookup_host(addr).await?;
 
-        // Return the SocketAddr from the SRV, or generate an Error.
-        return addr.next().ok_or_else(|| Error {
-            message: "unable to resolve".to_string(),
-            bad_server: true,
-            inner: None,
-        });
+        // If we have an address, return it. Otherwise, fall back.
+        if let Some(addr) = addr.next() {
+            tracing::debug!("srv resolved to {:?}", addr);
+            return Ok(addr);
+        }
+
+        tracing::debug!("srv did not resolve");
     }
 
-    // Attempt to resolve the host, before checking for SRV records.
+    // Attempt to resolve the host normally.
     let mut addr = lookup_host(format!("{}:{}", host, port)).await?;
 
     // If we got an address, we're done and it can be returned.
@@ -464,7 +465,7 @@ pub async fn send_query(host: &str, port: u16) -> Result<Query, Error> {
     socket.send(&request).await?;
 
     // Receive up to 2KiB from connection.
-    let mut buf: Vec<u8> = vec![0; 2048];
+    let mut buf: Vec<u8> = vec![0; 65_535];
     let len = socket.recv(&mut buf).await?;
 
     // Get the challenge token from the response.
@@ -478,7 +479,6 @@ pub async fn send_query(host: &str, port: u16) -> Result<Query, Error> {
     socket.send(&request).await?;
 
     // Receive data
-    // TODO: do we need handling for packets larger than 2KiB?
     let len = socket.recv(&mut buf).await?;
     // Ignore type, session ID, and padding before trying to parse data.
     let mut cursor = std::io::Cursor::new(&buf[16..len - 1]);
@@ -644,8 +644,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_query() {
-        match send_query("minescape.me", 25565).await {
+    async fn test_mcpe_query() {
+        match send_query("play.nethergames.org", 19132).await {
             Ok(query) => println!("{:?}", query),
             Err(err) => assert!(false, "should not error: {:?}", err),
         }
