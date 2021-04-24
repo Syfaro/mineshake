@@ -11,6 +11,7 @@ lazy_static! {
             trust_dns_resolver::config::ResolverConfig::cloudflare_tls(),
             trust_dns_resolver::config::ResolverOpts {
                 use_hosts_file: false,
+                cache_size: 2048,
                 ..Default::default()
             },
         )
