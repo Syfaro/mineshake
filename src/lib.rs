@@ -106,7 +106,6 @@ async fn resolve_srv(host: &str) -> Option<String> {
         trust_dns_resolver::config::ResolverConfig::default(),
         trust_dns_resolver::config::ResolverOpts::default(),
     )
-    .await
     .ok()?; // Discard any errors, assume it couldn't be resolved.
 
     let name = format!("_minecraft._tcp.{}", host);
@@ -166,11 +165,8 @@ impl Ping {
         // TODO: make this handle parsing extra fields
         match &self.description {
             serde_json::Value::Object(desc) => match desc.get("text") {
-                Some(text) => match text {
-                    serde_json::Value::String(text) => Some(text.to_string()),
-                    _ => None,
-                },
-                None => None,
+                Some(serde_json::Value::String(text)) => Some(text.to_string()),
+                _ => None,
             },
             _ => None,
         }
@@ -190,9 +186,9 @@ pub struct Error {
     inner: Option<Box<dyn std::error::Error>>,
 }
 
-impl Into<Option<Box<dyn std::error::Error>>> for Error {
-    fn into(self) -> Option<Box<dyn std::error::Error>> {
-        self.inner
+impl From<Error> for Option<Box<dyn std::error::Error>> {
+    fn from(other: Error) -> Self {
+        other.inner
     }
 }
 
@@ -429,7 +425,7 @@ pub async fn send_query(host: &str, port: u16) -> Result<Query, Error> {
     // Resolve our host and port to a SocketAddr, bind a socket,
     // and open a UDP connection to the host.
     let addr = resolve(host, port).await?;
-    let mut socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(addr).await?;
 
     // Generate and send a random session ID for our packet.
@@ -535,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_srv() {
-        let host = match resolve_srv("ping.minecraft.syfaro.net").await {
+        let host = match resolve_srv("minecraft.syfaro.net").await {
             Some(resolved) => resolved,
             None => {
                 assert!(false, "should be able to resolve srv record");
