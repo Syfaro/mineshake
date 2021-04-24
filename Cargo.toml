@@ -8,7 +8,8 @@ edition = "2018"
 tracing = "0.1"
 tracing-futures = "0.2"
 
-trust-dns-resolver = "0.20"
+trust-dns-resolver = { version = "0.20", features = ["dns-over-rustls"] }
+lazy_static = "1"
 rand = "0.8"
 
 serde = { version = "1", features = ["derive"] }

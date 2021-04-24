@@ -1,9 +1,21 @@
+use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{lookup_host, TcpStream, UdpSocket},
 };
 
-use serde::{Deserialize, Serialize};
+lazy_static! {
+    static ref RESOLVER: trust_dns_resolver::TokioAsyncResolver =
+        trust_dns_resolver::TokioAsyncResolver::tokio(
+            trust_dns_resolver::config::ResolverConfig::cloudflare_tls(),
+            trust_dns_resolver::config::ResolverOpts {
+                use_hosts_file: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+}
 
 /// Encode a u32 into a VarInt.
 fn encode_varint(num: u32) -> Vec<u8> {
@@ -102,14 +114,8 @@ fn build_handshake(host: &str, port: u16) -> Vec<u8> {
 /// `host:port` format.
 #[tracing::instrument]
 async fn resolve_srv(host: &str) -> Option<String> {
-    let resolver = trust_dns_resolver::TokioAsyncResolver::tokio(
-        trust_dns_resolver::config::ResolverConfig::default(),
-        trust_dns_resolver::config::ResolverOpts::default(),
-    )
-    .ok()?; // Discard any errors, assume it couldn't be resolved.
-
     let name = format!("_minecraft._tcp.{}", host);
-    let lookup = resolver.srv_lookup(name).await;
+    let lookup = RESOLVER.srv_lookup(name).await;
 
     tracing::debug!("host srv resolved to {:?}", lookup);
 
